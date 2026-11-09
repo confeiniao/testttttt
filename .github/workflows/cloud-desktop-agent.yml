@@ -1,0 +1,104 @@
+name: Cloud Desktop Agent (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "在线分钟数（留空用 Variable / 默认 120，上限 350）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-desktop-agent
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      SESSION_MINUTES: ${{ inputs.duration_minutes || vars.CLOUD_SESSION_MINUTES || '120' }}
+
+    steps:
+      - name: 准备 Node.js 22            # 内置全局 WebSocket，客户端脚本零依赖
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 校验 Secret 与参数
+        shell: pwsh
+        env:
+          AGENT_URL: ${{ secrets.CLOUD_AGENT_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:AGENT_URL)) { throw '缺少 Secret CLOUD_AGENT_URL' }
+          $mins = [int]$env:SESSION_MINUTES
+          if ($mins -lt 1 -or $mins -gt 350) { throw 'duration_minutes 需在 1~350' }
+          Write-Host "计划在线 $mins 分钟（脚本地址不打印）"
+
+      - name: 安装并配置 TightVNC（仅回环、关闭 VNC 认证）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install tightvnc -y --no-progress --limit-output
+          $paths = @('HKLM:\SOFTWARE\TightVNC\Server','HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server')
+          foreach ($p in $paths) {
+            if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
+            New-ItemProperty -Path $p -Name 'AllowLoopback'        -Value 1    -PropertyType DWord -Force | Out-Null
+            New-ItemProperty -Path $p -Name 'LoopbackOnly'         -Value 1    -PropertyType DWord -Force | Out-Null
+            New-ItemProperty -Path $p -Name 'UseVncAuthentication' -Value 0    -PropertyType DWord -Force | Out-Null
+            New-ItemProperty -Path $p -Name 'RfbPort'              -Value 5900 -PropertyType DWord -Force | Out-Null
+          }
+          $svc = Get-Service -Name tvnserver -ErrorAction SilentlyContinue
+          if ($svc) { Restart-Service -Name tvnserver -Force }
+          else { Start-Process -FilePath 'C:\Program Files\TightVNC\tvnserver.exe' -ArgumentList '-run' }
+          $ok = $false
+          for ($i=0; $i -lt 30; $i++) {
+            if ((Test-NetConnection 127.0.0.1 -Port 5900 -WarningAction SilentlyContinue).TcpTestSucceeded) { $ok=$true; break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $ok) { throw 'TightVNC 未在 127.0.0.1:5900 监听' }
+          Write-Host 'TightVNC 就绪（仅回环、无 VNC 密码）'
+
+      - name: 下载客户端桥接脚本
+        shell: pwsh
+        env:
+          AGENT_URL: ${{ secrets.CLOUD_AGENT_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:RUNNER_TEMP 'cloud-agent.js'
+          Invoke-WebRequest -UseBasicParsing -Uri $env:AGENT_URL -OutFile $script
+          if ((Get-Item $script).Length -lt 100) { throw '脚本下载异常，检查 Secret 是否失效' }
+          Write-Host "脚本已下载：$((Get-Item $script).Length) 字节"
+
+      - name: 启动反向桥接并保持会话
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:RUNNER_TEMP 'cloud-agent.js'
+          $out = Join-Path $env:RUNNER_TEMP 'agent.out.log'
+          $err = Join-Path $env:RUNNER_TEMP 'agent.err.log'
+          Start-Process -FilePath 'notepad.exe' -ErrorAction SilentlyContinue
+          function Start-Agent {
+            Start-Process -FilePath 'node' -ArgumentList "`"$script`"" -PassThru -WindowStyle Hidden `
+              -RedirectStandardOutput $out -RedirectStandardError $err
+          }
+          $agent = Start-Agent
+          Write-Host "Agent 已启动 (PID $($agent.Id))，面板应变为绿色「在线」"
+          $deadline = (Get-Date).AddMinutes([int]$env:SESSION_MINUTES)
+          $tick = 0
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 60
+            $tick++
+            if ($agent.HasExited) { Write-Warning 'Agent 退出，重启…'; $agent = Start-Agent }
+            $vnc = (Test-NetConnection 127.0.0.1 -Port 5900 -WarningAction SilentlyContinue).TcpTestSucceeded
+            Write-Host ("[{0}] alive {1} min | agent={2} | vnc5900={3}" -f (Get-Date -Format 'HH:mm:ss'), $tick, (-not $agent.HasExited), $vnc)
+            if ($tick % 10 -eq 0) {
+              if (Test-Path $out) { Get-Content $out -Tail 5 }
+              if (Test-Path $err) { Get-Content $err -Tail 5 }
+            }
+          }
+          Write-Host '时长到期，job 结束，设备自动离线'
